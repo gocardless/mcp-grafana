@@ -16,7 +16,7 @@ This provides access to your Grafana instance and the surrounding ecosystem.
 
 **What's added:** two CLI flags, `--oauth-authorization-server` and `--oauth-resource` (see [CLI Flags Reference](#cli-flags-reference)), and — only when the first is set — a new `GET /.well-known/oauth-protected-resource` endpoint on the SSE/streamable-http transports.
 
-**Why:** when `mcp-grafana` runs behind an infrastructure-level auth gate such as GCP Identity-Aware Proxy (IAP), MCP clients need a standard way to obtain a token that gate will accept, rather than a static shared secret. [`iap-mcp-auth`](https://github.com/gocardless/iap-mcp-auth) is GoCardless's shared OAuth 2.1 authorization server ("broker") that brokers Google OAuth for this purpose: it implements dynamic client registration (RFC 7591) and the PKCE authorization code flow, exchanges the resulting code with Google, and hands the client a Google ID token that IAP validates.
+**Why:** when `mcp-grafana` runs behind an infrastructure-level auth gate such as GCP Identity-Aware Proxy (IAP), MCP clients need a standard way to obtain a token that gate will accept, rather than a static shared secret. GoCardless runs an internal OAuth 2.1 authorization server ("broker") for this purpose: it implements dynamic client registration (RFC 7591) and the PKCE authorization code flow, exchanges the resulting code with Google, and hands the client a Google ID token that IAP validates.
 
 `mcp-grafana` itself never talks to the broker or to Google — its only role is to advertise, at a well-known path, which broker protects it, so an MCP client can discover and use it automatically:
 
@@ -28,7 +28,7 @@ This provides access to your Grafana instance and the surrounding ecosystem.
      "authorization_servers": ["https://mcp-auth-broker.example.com"]
    }
    ```
-3. An OAuth-capable MCP client fetches that document, then follows it to the broker's own `/.well-known/oauth-authorization-server` metadata, registers a client, and runs the PKCE flow through the broker and Google. See the [`iap-mcp-auth` README](https://github.com/gocardless/iap-mcp-auth#how-it-works) for the full sequence diagram.
+3. An OAuth-capable MCP client fetches that document, then follows it to the broker's own `/.well-known/oauth-authorization-server` metadata, registers a client, and runs the PKCE flow through the broker and Google.
 4. The client presents the resulting Google ID token to `mcp-grafana` as `Authorization: Bearer <token>` on every request. IAP validates that token at the infrastructure layer in front of the server; `mcp-grafana` does not itself parse or verify it, so this is independent of (and can be combined with) the upstream `--server-auth-token` caller-auth flag.
 
 **This is purely advertisement — it does not, by itself, protect the server.** The actual enforcement is IAP sitting in front of `mcp-grafana`. Two things must also be true at the infrastructure level for the flow to work:
