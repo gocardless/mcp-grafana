@@ -1192,6 +1192,101 @@ func TestCallerAuthConfigResolveToken(t *testing.T) {
 	})
 }
 
+func TestOAuthResourceConfigResolveAuthorizationServer(t *testing.T) {
+	t.Run("flag takes precedence and is trimmed", func(t *testing.T) {
+		t.Setenv(oauthAuthorizationServerEnvVar, "https://from-env.example.com")
+		oc := oauthResourceConfig{authorizationServer: "  https://from-flag.example.com  "}
+		assert.Equal(t, "https://from-flag.example.com", oc.resolveAuthorizationServer())
+	})
+
+	t.Run("falls back to env when flag empty", func(t *testing.T) {
+		t.Setenv(oauthAuthorizationServerEnvVar, "  https://from-env.example.com  ")
+		oc := oauthResourceConfig{}
+		assert.Equal(t, "https://from-env.example.com", oc.resolveAuthorizationServer())
+	})
+
+	t.Run("empty when neither set", func(t *testing.T) {
+		t.Setenv(oauthAuthorizationServerEnvVar, "")
+		oc := oauthResourceConfig{}
+		assert.Empty(t, oc.resolveAuthorizationServer())
+	})
+}
+
+func TestRequestBaseURL(t *testing.T) {
+	t.Run("uses https for a direct TLS connection", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "https://mcp-grafana.example.com/", nil)
+		assert.Equal(t, "https://mcp-grafana.example.com", requestBaseURL(req))
+	})
+
+	t.Run("falls back to http for a direct plaintext connection", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Host = "localhost:8000"
+		assert.Equal(t, "http://localhost:8000", requestBaseURL(req))
+	})
+
+	t.Run("honors X-Forwarded-Proto from a trusted proxy", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Host = "mcp-grafana.example.com"
+		req.Header.Set("X-Forwarded-Proto", "https")
+		assert.Equal(t, "https://mcp-grafana.example.com", requestBaseURL(req))
+	})
+}
+
+func TestOAuthProtectedResourceHandler(t *testing.T) {
+	t.Run("derives resource from the request when no override is set", func(t *testing.T) {
+		h := oauthProtectedResourceHandler("https://mcp-auth-broker.example.com", "", "/mcp")
+		req := httptest.NewRequest(http.MethodGet, oauthProtectedResourcePath, nil)
+		req.Host = "mcp-grafana.example.com"
+		req.Header.Set("X-Forwarded-Proto", "https")
+		rec := httptest.NewRecorder()
+		h(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+
+		var body struct {
+			Resource             string   `json:"resource"`
+			AuthorizationServers []string `json:"authorization_servers"`
+		}
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+		assert.Equal(t, "https://mcp-grafana.example.com/mcp", body.Resource)
+		assert.Equal(t, []string{"https://mcp-auth-broker.example.com"}, body.AuthorizationServers)
+	})
+
+	t.Run("an explicit resource override wins over the request-derived one", func(t *testing.T) {
+		h := oauthProtectedResourceHandler("https://mcp-auth-broker.example.com", "https://mcp-grafana.example.com/mcp", "/mcp")
+		req := httptest.NewRequest(http.MethodGet, oauthProtectedResourcePath, nil)
+		req.Host = "some-other-host:8000"
+		rec := httptest.NewRecorder()
+		h(rec, req)
+
+		var body struct {
+			Resource string `json:"resource"`
+		}
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+		assert.Equal(t, "https://mcp-grafana.example.com/mcp", body.Resource)
+	})
+}
+
+// TestOAuthProtectedResourceUnauthenticatedAlongsideCallerAuth mirrors how
+// run() composes the mux: the MCP endpoint is wrapped with withCallerAuth,
+// but /.well-known/oauth-protected-resource is registered directly on the
+// mux and must stay reachable without a bearer token — an MCP client has no
+// token to present until after it has fetched this document.
+func TestOAuthProtectedResourceUnauthenticatedAlongsideCallerAuth(t *testing.T) {
+	const endpointPath = "/mcp"
+	mux := http.NewServeMux()
+	mux.Handle(endpointPath, withCallerAuth("secret-token", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})))
+	mux.HandleFunc(oauthProtectedResourcePath, oauthProtectedResourceHandler("https://mcp-auth-broker.example.com", "", endpointPath))
+
+	assert.Equal(t, http.StatusOK, getPath(mux, oauthProtectedResourcePath).Code,
+		"well-known metadata must be reachable without a bearer token")
+	assert.Equal(t, http.StatusUnauthorized, getPath(mux, endpointPath).Code,
+		"the MCP endpoint itself must still require caller auth")
+}
+
 func TestCheckCallerAuthPolicy(t *testing.T) {
 	cases := []struct {
 		name      string

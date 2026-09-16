@@ -10,6 +10,49 @@ A [Model Context Protocol][mcp] (MCP) server for Grafana.
 
 This provides access to your Grafana instance and the surrounding ecosystem.
 
+## GoCardless Fork: OAuth Broker Integration
+
+> This is a GoCardless-internal fork of [`grafana/mcp-grafana`](https://github.com/grafana/mcp-grafana). This section documents everything added on top of upstream; everywhere else in this README describes unmodified upstream behavior. The only change is additive and opt-in (two new flags, both unset by default) — there are no changes to any existing flag, tool, or endpoint.
+
+**What's added:** two CLI flags, `--oauth-authorization-server` and `--oauth-resource` (see [CLI Flags Reference](#cli-flags-reference)), and — only when the first is set — a new `GET /.well-known/oauth-protected-resource` endpoint on the SSE/streamable-http transports.
+
+**Why:** when `mcp-grafana` runs behind an infrastructure-level auth gate such as GCP Identity-Aware Proxy (IAP), MCP clients need a standard way to obtain a token that gate will accept, rather than a static shared secret. [`iap-mcp-auth`](https://github.com/gocardless/iap-mcp-auth) is GoCardless's shared OAuth 2.1 authorization server ("broker") that brokers Google OAuth for this purpose: it implements dynamic client registration (RFC 7591) and the PKCE authorization code flow, exchanges the resulting code with Google, and hands the client a Google ID token that IAP validates.
+
+`mcp-grafana` itself never talks to the broker or to Google — its only role is to advertise, at a well-known path, which broker protects it, so an MCP client can discover and use it automatically:
+
+1. Set `--oauth-authorization-server` (or `MCP_GRAFANA_OAUTH_AUTHORIZATION_SERVER`) to the broker's base URL, e.g. `https://mcp-auth-broker.example.com`.
+2. `mcp-grafana` then serves `GET /.well-known/oauth-protected-resource` with RFC 9728 protected-resource metadata:
+   ```json
+   {
+     "resource": "https://mcp-grafana.example.com/mcp",
+     "authorization_servers": ["https://mcp-auth-broker.example.com"]
+   }
+   ```
+3. An OAuth-capable MCP client fetches that document, then follows it to the broker's own `/.well-known/oauth-authorization-server` metadata, registers a client, and runs the PKCE flow through the broker and Google. See the [`iap-mcp-auth` README](https://github.com/gocardless/iap-mcp-auth#how-it-works) for the full sequence diagram.
+4. The client presents the resulting Google ID token to `mcp-grafana` as `Authorization: Bearer <token>` on every request. IAP validates that token at the infrastructure layer in front of the server; `mcp-grafana` does not itself parse or verify it, so this is independent of (and can be combined with) the upstream `--server-auth-token` caller-auth flag.
+
+**This is purely advertisement — it does not, by itself, protect the server.** The actual enforcement is IAP sitting in front of `mcp-grafana`. Two things must also be true at the infrastructure level for the flow to work:
+
+- The IAP configuration (or upstream load balancer) must allow unauthenticated access specifically to `/.well-known/oauth-protected-resource`, since an MCP client has no token to present until after it has fetched that document.
+- The broker's own registered Google OAuth client must trust `mcp-grafana`'s deployment as an IAP-protected resource (see the broker's production deployment checklist).
+
+**Flags:**
+
+- `--oauth-authorization-server`: Base URL of the broker (e.g. `https://mcp-auth-broker.example.com`). When set, the server exposes `GET /.well-known/oauth-protected-resource` (RFC 9728) advertising it. Falls back to the `MCP_GRAFANA_OAUTH_AUTHORIZATION_SERVER` environment variable. Unset by default — the endpoint is not exposed, and behavior is identical to upstream.
+- `--oauth-resource`: Overrides the `resource` identifier in the metadata document. Defaults to the request's scheme and `Host` header plus `--endpoint-path` (streamable-http) or `--base-path` (sse); only needed if the server is reachable through more than one hostname.
+
+**Example:**
+
+```bash
+./mcp-grafana -t streamable-http \
+  --address 0.0.0.0:8000 \
+  --oauth-authorization-server https://mcp-auth-broker.example.com
+```
+
+```bash
+curl https://mcp-grafana.example.com/.well-known/oauth-protected-resource
+```
+
 ## Quick Start
 
 Requires [uv](https://docs.astral.sh/uv/getting-started/installation/). Add the following to your MCP client configuration (e.g. Claude Desktop, Cursor):
@@ -426,6 +469,8 @@ Optionally require MCP clients to authenticate *to the server*. This is separate
 - `--server-auth-token`: Bearer token callers must send as `Authorization: Bearer <token>`. Falls back to the `MCP_GRAFANA_SERVER_TOKEN` environment variable. When set, requests without a valid token are rejected with `401` before any tool runs. Prefer the env var so the secret isn't visible in the process arguments.
 
 Caller authentication is enforced only when `--server-auth-token` is set. When it isn't and the server binds a non-loopback address, the server **starts but logs a security error** — emitted at the `error` log level so it isn't hidden by `--log-level` (loopback and stdio are unaffected); a future major release will make that a startup error. Use TLS (or TLS termination) whenever caller auth is enabled on a non-loopback address. When caller auth is enabled, the validated `Authorization` header is stripped before requests reach Grafana; combining `--server-auth-token` with `GRAFANA_FORWARD_HEADERS=Authorization` is rejected at startup.
+
+> **GoCardless fork:** `--oauth-authorization-server` and `--oauth-resource` are additions not present upstream. See [GoCardless Fork: OAuth Broker Integration](#gocardless-fork-oauth-broker-integration) for what they do and why.
 
 **Debug and Logging:**
 - `--debug`: Enable debug mode for detailed HTTP request/response logging
