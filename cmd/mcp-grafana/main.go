@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -369,6 +370,22 @@ func socks5ProxyFromEnv() (string, error) {
 	return raw, nil
 }
 
+// hostHeaderFromEnv reads GRAFANA_HOST_HEADER and validates it so a
+// misconfigured value fails at startup instead of silently 302-redirect-looping
+// on every Grafana request behind a domain-enforcing proxy (e.g. Grafana's own
+// enforce_domain setting) once GRAFANA_URL points somewhere other than that
+// domain. Extracted from main so the handling is unit-testable.
+func hostHeaderFromEnv() (string, error) {
+	raw := strings.TrimSpace(os.Getenv("GRAFANA_HOST_HEADER"))
+	if raw == "" {
+		return "", nil
+	}
+	if err := mcpgrafana.ValidateHostHeader(raw); err != nil {
+		return "", fmt.Errorf("invalid GRAFANA_HOST_HEADER: %w", err)
+	}
+	return raw, nil
+}
+
 // validateLokiGuardrail rejects invalid guardrail settings (unknown mode,
 // negative limits) after flag and env processing. Extracted from main so the
 // validation is unit-testable.
@@ -703,6 +720,94 @@ func (ca callerAuthConfig) resolveToken() string {
 	return strings.TrimSpace(os.Getenv(serverAuthTokenEnvVar))
 }
 
+// oauthAuthorizationServerEnvVar is the env fallback for
+// --oauth-authorization-server, mirroring serverAuthTokenEnvVar.
+const oauthAuthorizationServerEnvVar = "MCP_GRAFANA_OAUTH_AUTHORIZATION_SERVER"
+
+// oauthResourceEnvVar is the env fallback for --oauth-resource.
+const oauthResourceEnvVar = "MCP_GRAFANA_OAUTH_RESOURCE"
+
+// oauthProtectedResourcePath is the RFC 9728 well-known path MCP clients
+// probe to discover which OAuth authorization server protects this resource.
+const oauthProtectedResourcePath = "/.well-known/oauth-protected-resource"
+
+// oauthResourceConfig configures discovery of an external OAuth 2.1
+// authorization server (a "broker") that fronts this server behind something
+// like GCP Identity-Aware Proxy. It is unrelated to callerAuthConfig: the
+// broker mediates a real OAuth flow so an MCP client can obtain a token the
+// proxy accepts, whereas --server-auth-token is a static shared secret this
+// process checks itself. The broker's URL is entirely operator-supplied
+// (flag or env var); nothing here is specific to any particular deployment.
+type oauthResourceConfig struct {
+	// authorizationServer is the base URL of the broker, e.g.
+	// "https://mcp-auth-broker.example.com". Empty disables the endpoint.
+	authorizationServer string
+
+	// resource overrides the "resource" identifier advertised in the
+	// metadata document. When empty it is derived per-request from the
+	// request's scheme and Host header plus the MCP endpoint/base path,
+	// which is correct as long as the server is reachable through a single
+	// canonical hostname (the norm behind IAP).
+	resource string
+}
+
+func (oc *oauthResourceConfig) addFlags() {
+	flag.StringVar(&oc.authorizationServer, "oauth-authorization-server", "", "Base URL of an external OAuth 2.1 authorization server/broker that MCP clients should use to obtain a token for this server. When set, the server exposes GET "+oauthProtectedResourcePath+" (RFC 9728) advertising it, so OAuth-capable MCP clients can discover it automatically. Falls back to the "+oauthAuthorizationServerEnvVar+" environment variable. Has no effect on the stdio transport.")
+	flag.StringVar(&oc.resource, "oauth-resource", "", "Canonical resource identifier advertised in the protected-resource metadata document. Defaults to the request's scheme and Host plus --endpoint-path (streamable-http) or --base-path (sse); set explicitly only if this server is reachable through more than one hostname. Falls back to the "+oauthResourceEnvVar+" environment variable.")
+}
+
+// resolveAuthorizationServer returns the configured broker URL, falling back
+// to the env var. Trimmed so whitespace from a config mount can't produce a
+// non-empty-looking but broken value.
+func (oc oauthResourceConfig) resolveAuthorizationServer() string {
+	if v := strings.TrimSpace(oc.authorizationServer); v != "" {
+		return v
+	}
+	return strings.TrimSpace(os.Getenv(oauthAuthorizationServerEnvVar))
+}
+
+// resolveResource returns the configured resource override, falling back to
+// the env var. Empty means "derive it per-request" — see requestBaseURL.
+func (oc oauthResourceConfig) resolveResource() string {
+	if v := strings.TrimSpace(oc.resource); v != "" {
+		return v
+	}
+	return strings.TrimSpace(os.Getenv(oauthResourceEnvVar))
+}
+
+// requestBaseURL reconstructs scheme://host from an inbound request, honoring
+// X-Forwarded-Proto from a trusted reverse proxy (IAP/GCLB terminate TLS at
+// the edge, so the server itself typically sees plain HTTP on the wire but
+// gets told the original scheme via this header). Falls back to https unless
+// the connection is both unproxied and non-TLS, e.g. local development.
+func requestBaseURL(r *http.Request) string {
+	scheme := "https"
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
+	} else if r.TLS == nil {
+		scheme = "http"
+	}
+	return scheme + "://" + r.Host
+}
+
+// oauthProtectedResourceHandler serves RFC 9728 OAuth protected-resource
+// metadata, pointing MCP clients at the configured authorization server
+// (broker). It is always left unauthenticated on the mux: a client has no
+// token to present until after it has fetched this document.
+func oauthProtectedResourceHandler(authorizationServer, resourceOverride, mountPath string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		resource := resourceOverride
+		if resource == "" {
+			resource = requestBaseURL(r) + mountPath
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"resource":              resource,
+			"authorization_servers": []string{authorizationServer},
+		})
+	}
+}
+
 // checkCallerAuthPolicy logs the caller-authentication posture of a network
 // transport at startup. Caller auth is enforced only when a token is configured
 // (see withCallerAuth); this surfaces the posture so it isn't silently exposed:
@@ -914,7 +1019,7 @@ func runOpsServer(addr string, h http.Handler) {
 	}
 }
 
-func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt disabledTools, gc mcpgrafana.GrafanaConfig, tls tlsConfig, hsc httpSecurityConfig, ca callerAuthConfig, obs observability.Config, sessionIdleTimeoutMinutes int, healthzAddress, instructionsAppend string) error {
+func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt disabledTools, gc mcpgrafana.GrafanaConfig, tls tlsConfig, hsc httpSecurityConfig, ca callerAuthConfig, oc oauthResourceConfig, obs observability.Config, sessionIdleTimeoutMinutes int, healthzAddress, instructionsAppend string) error {
 	stderrHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})
 	slog.SetDefault(slog.New(stderrHandler))
 
@@ -1043,6 +1148,10 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 			mcpgrafana.ValidateGrafanaURLMiddleware(srv), //nolint:staticcheck // Retained temporarily to reject malformed legacy headers.
 			basePath,
 		)))
+		if authServer := oc.resolveAuthorizationServer(); authServer != "" {
+			mux.HandleFunc(oauthProtectedResourcePath, oauthProtectedResourceHandler(authServer, oc.resolveResource(), basePath))
+			slog.Info("OAuth protected-resource metadata enabled", "path", oauthProtectedResourcePath, "authorization_server", authServer)
+		}
 		runOpsServers(registerOps(mux, o, healthzAddress, obs))
 		// Wrap the full mux so ops routes left on it are validated too.
 		httpSrv.Handler = mcpgrafana.DNSRebindingProtectionMiddleware(hsc.policy(addr))(mux)
@@ -1077,6 +1186,10 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 			mcpgrafana.ValidateGrafanaURLMiddleware(srv), //nolint:staticcheck // Retained temporarily to reject malformed legacy headers.
 			endpointPath,
 		)))
+		if authServer := oc.resolveAuthorizationServer(); authServer != "" {
+			mux.HandleFunc(oauthProtectedResourcePath, oauthProtectedResourceHandler(authServer, oc.resolveResource(), endpointPath))
+			slog.Info("OAuth protected-resource metadata enabled", "path", oauthProtectedResourcePath, "authorization_server", authServer)
+		}
 		runOpsServers(registerOps(mux, o, healthzAddress, obs))
 		// Wrap the full mux so ops routes left on it are validated too.
 		httpSrv.Handler = mcpgrafana.DNSRebindingProtectionMiddleware(hsc.policy(addr))(mux)
@@ -1116,6 +1229,8 @@ func main() {
 	hsc.addFlags()
 	var ca callerAuthConfig
 	ca.addFlags()
+	var oc oauthResourceConfig
+	oc.addFlags()
 	var obs observability.Config
 	flag.BoolVar(&obs.MetricsEnabled, "metrics", false, "Enable Prometheus metrics endpoint")
 	flag.StringVar(&obs.MetricsAddress, "metrics-address", "", "Separate address for metrics server (e.g., :9090). If empty, metrics are served on the main server at /metrics")
@@ -1177,6 +1292,12 @@ func main() {
 		os.Exit(2)
 	}
 
+	hostHeader, err := hostHeaderFromEnv()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+
 	// Enable per-call org selection before any tools are registered, so their
 	// schemas and the override middleware are wired in consistently.
 	mcpgrafana.DynamicMultiOrgEnabled = gc.dynamicMultiOrg
@@ -1191,6 +1312,7 @@ func main() {
 		IncludeArgumentsInSpans: gc.includeArgsInSpans,
 		Timeout:                 gc.timeout,
 		SOCKS5ProxyURL:          socks5Proxy,
+		HostHeader:              hostHeader,
 	}
 	if gc.tlsCertFile != "" || gc.tlsKeyFile != "" || gc.tlsCAFile != "" || gc.tlsSkipVerify {
 		grafanaConfig.TLSConfig = &mcpgrafana.TLSConfig{
@@ -1237,7 +1359,7 @@ func main() {
 		level = slog.LevelDebug
 	}
 
-	if err := run(transport, *addr, *basePath, *endpointPath, level, dt, grafanaConfig, tls, hsc, ca, obs, *sessionIdleTimeoutMinutes, *healthzAddress, *instructionsAppend); err != nil {
+	if err := run(transport, *addr, *basePath, *endpointPath, level, dt, grafanaConfig, tls, hsc, ca, oc, obs, *sessionIdleTimeoutMinutes, *healthzAddress, *instructionsAppend); err != nil {
 		panic(err)
 	}
 }

@@ -10,6 +10,77 @@ A [Model Context Protocol][mcp] (MCP) server for Grafana.
 
 This provides access to your Grafana instance and the surrounding ecosystem.
 
+## GoCardless Fork
+
+> This is a GoCardless-internal fork of [`grafana/mcp-grafana`](https://github.com/grafana/mcp-grafana). This section documents everything added on top of upstream; everywhere else in this README describes unmodified upstream behavior. Every change below is additive and opt-in (new flags/env vars, all unset by default) — there are no changes to any existing flag, tool, or endpoint.
+
+### OAuth Broker Integration
+
+**What's added:** two CLI flags, `--oauth-authorization-server` and `--oauth-resource` (see [CLI Flags Reference](#cli-flags-reference)), and — only when the first is set — a new `GET /.well-known/oauth-protected-resource` endpoint on the SSE/streamable-http transports.
+
+**Why:** when `mcp-grafana` runs behind an infrastructure-level auth gate such as GCP Identity-Aware Proxy (IAP), MCP clients need a standard way to obtain a token that gate will accept, rather than a static shared secret. GoCardless runs an internal OAuth 2.1 authorization server ("broker") for this purpose: it implements dynamic client registration (RFC 7591) and the PKCE authorization code flow, exchanges the resulting code with Google, and hands the client a Google ID token that IAP validates.
+
+`mcp-grafana` itself never talks to the broker or to Google — its only role is to advertise, at a well-known path, which broker protects it, so an MCP client can discover and use it automatically:
+
+1. Set `--oauth-authorization-server` (or `MCP_GRAFANA_OAUTH_AUTHORIZATION_SERVER`) to the broker's base URL, e.g. `https://mcp-auth-broker.example.com`.
+2. `mcp-grafana` then serves `GET /.well-known/oauth-protected-resource` with RFC 9728 protected-resource metadata:
+   ```json
+   {
+     "resource": "https://mcp-grafana.example.com/mcp",
+     "authorization_servers": ["https://mcp-auth-broker.example.com"]
+   }
+   ```
+3. An OAuth-capable MCP client fetches that document, then follows it to the broker's own `/.well-known/oauth-authorization-server` metadata, registers a client, and runs the PKCE flow through the broker and Google.
+4. The client presents the resulting Google ID token to `mcp-grafana` as `Authorization: Bearer <token>` on every request. IAP validates that token at the infrastructure layer in front of the server; `mcp-grafana` does not itself parse or verify it, so this is independent of (and can be combined with) the upstream `--server-auth-token` caller-auth flag.
+
+**This is purely advertisement — it does not, by itself, protect the server.** The actual enforcement is IAP sitting in front of `mcp-grafana`. Two things must also be true at the infrastructure level for the flow to work:
+
+- The IAP configuration (or upstream load balancer) must allow unauthenticated access specifically to `/.well-known/oauth-protected-resource`, since an MCP client has no token to present until after it has fetched that document.
+- The broker's own registered Google OAuth client must trust `mcp-grafana`'s deployment as an IAP-protected resource (see the broker's production deployment checklist).
+
+**Flags:**
+
+- `--oauth-authorization-server`: Base URL of the broker (e.g. `https://mcp-auth-broker.example.com`). When set, the server exposes `GET /.well-known/oauth-protected-resource` (RFC 9728) advertising it. Falls back to the `MCP_GRAFANA_OAUTH_AUTHORIZATION_SERVER` environment variable. Unset by default — the endpoint is not exposed, and behavior is identical to upstream.
+- `--oauth-resource`: Overrides the `resource` identifier in the metadata document. Defaults to the request's scheme and `Host` header plus `--endpoint-path` (streamable-http) or `--base-path` (sse); only needed if the server is reachable through more than one hostname. Falls back to the `MCP_GRAFANA_OAUTH_RESOURCE` environment variable.
+
+**Example:**
+
+```bash
+./mcp-grafana -t streamable-http \
+  --address 0.0.0.0:8000 \
+  --oauth-authorization-server https://mcp-auth-broker.example.com
+```
+
+```bash
+curl https://mcp-grafana.example.com/.well-known/oauth-protected-resource
+```
+
+### Host Header Override for Domain-Enforced Grafana Instances
+
+**What's added:** one environment variable, `GRAFANA_HOST_HEADER`, read by every transport (stdio, sse, streamable-http).
+
+**Why:** `GRAFANA_URL`'s hostname normally serves two purposes at once — it's both the network address `mcp-grafana` dials, and the `Host` header it sends. Those two things are usually the same value, but not always: some Grafana instances (including ones deployed with `enforce_domain: true`, which redirects any request whose `Host` header doesn't match the configured domain) are reachable at a different network address than the hostname they expect to be addressed as — for example an instance sitting behind an external load balancer that also does IAP-style auth, but reachable directly (bypassing that load balancer, and therefore that auth gate) via an internal address when `mcp-grafana` runs on the same cluster/VPC. Without a way to separate "where to dial" from "what Host header to send", using that internal address trips the domain check and every request gets redirected instead of served.
+
+`GRAFANA_HOST_HEADER`, when set, overrides only the outgoing `Host` header — `GRAFANA_URL` still determines what address the request is actually dialed against. It does not affect TLS SNI (Go derives that from the request URL, not the Host header), so it only really matters for a plaintext `http://` route to an internal address; there's no split-horizon DNS or Kubernetes `hostAliases` trick required.
+
+**Example:** `mcp-grafana` reaching an in-cluster Grafana Service directly (bypassing an external load balancer/IAP) while still satisfying that Grafana's `enforce_domain` check:
+
+```json
+{
+  "mcpServers": {
+    "grafana": {
+      "command": "mcp-grafana",
+      "args": [],
+      "env": {
+        "GRAFANA_URL": "http://grafana-server.grafana.svc.cluster.local:3000",
+        "GRAFANA_HOST_HEADER": "grafana.example.com",
+        "GRAFANA_SERVICE_ACCOUNT_TOKEN": "<your service account token>"
+      }
+    }
+  }
+}
+```
+
 ## Quick Start
 
 Requires [uv](https://docs.astral.sh/uv/getting-started/installation/). Add the following to your MCP client configuration (e.g. Claude Desktop, Cursor):
@@ -429,6 +500,8 @@ Optionally require MCP clients to authenticate *to the server*. This is separate
 
 Caller authentication is enforced only when `--server-auth-token` is set. When it isn't and the server binds a non-loopback address, the server **starts but logs a security error** — emitted at the `error` log level so it isn't hidden by `--log-level` (loopback and stdio are unaffected); a future major release will make that a startup error. Use TLS (or TLS termination) whenever caller auth is enabled on a non-loopback address. When caller auth is enabled, the validated `Authorization` header is stripped before requests reach Grafana; combining `--server-auth-token` with `GRAFANA_FORWARD_HEADERS=Authorization` is rejected at startup.
 
+> **GoCardless fork:** `--oauth-authorization-server` and `--oauth-resource` are additions not present upstream. See [GoCardless Fork → OAuth Broker Integration](#oauth-broker-integration) for what they do and why.
+
 **Debug and Logging:**
 - `--debug`: Enable debug mode for detailed HTTP request/response logging
 - `--log-level`: Log level (`debug`, `info`, `warn`, `error`) - default: `info`
@@ -700,6 +773,8 @@ You can add arbitrary HTTP headers to all Grafana API requests using the `GRAFAN
   }
 }
 ```
+
+> **GoCardless fork:** this cannot be used to override the `Host` header — Go's HTTP client always takes the wire `Host` from the request URL (or `Request.Host`), never from a header map entry. For that, see [GoCardless Fork → Host Header Override](#host-header-override-for-domain-enforced-grafana-instances), which adds `GRAFANA_HOST_HEADER` for exactly this case.
 
 ### SOCKS5 Proxy
 
