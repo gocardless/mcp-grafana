@@ -370,6 +370,22 @@ func socks5ProxyFromEnv() (string, error) {
 	return raw, nil
 }
 
+// hostHeaderFromEnv reads GRAFANA_HOST_HEADER and validates it so a
+// misconfigured value fails at startup instead of silently 302-redirect-looping
+// on every Grafana request behind a domain-enforcing proxy (e.g. Grafana's own
+// enforce_domain setting) once GRAFANA_URL points somewhere other than that
+// domain. Extracted from main so the handling is unit-testable.
+func hostHeaderFromEnv() (string, error) {
+	raw := strings.TrimSpace(os.Getenv("GRAFANA_HOST_HEADER"))
+	if raw == "" {
+		return "", nil
+	}
+	if err := mcpgrafana.ValidateHostHeader(raw); err != nil {
+		return "", fmt.Errorf("invalid GRAFANA_HOST_HEADER: %w", err)
+	}
+	return raw, nil
+}
+
 // validateLokiGuardrail rejects invalid guardrail settings (unknown mode,
 // negative limits) after flag and env processing. Extracted from main so the
 // validation is unit-testable.
@@ -1288,6 +1304,12 @@ func main() {
 		os.Exit(2)
 	}
 
+	hostHeader, err := hostHeaderFromEnv()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+
 	// Enable per-call org selection before any tools are registered, so their
 	// schemas and the override middleware are wired in consistently.
 	mcpgrafana.DynamicMultiOrgEnabled = gc.dynamicMultiOrg
@@ -1302,6 +1324,7 @@ func main() {
 		IncludeArgumentsInSpans: gc.includeArgsInSpans,
 		Timeout:                 gc.timeout,
 		SOCKS5ProxyURL:          socks5Proxy,
+		HostHeader:              hostHeader,
 	}
 	if gc.tlsCertFile != "" || gc.tlsKeyFile != "" || gc.tlsCAFile != "" || gc.tlsSkipVerify {
 		grafanaConfig.TLSConfig = &mcpgrafana.TLSConfig{

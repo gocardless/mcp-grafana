@@ -10,9 +10,11 @@ A [Model Context Protocol][mcp] (MCP) server for Grafana.
 
 This provides access to your Grafana instance and the surrounding ecosystem.
 
-## GoCardless Fork: OAuth Broker Integration
+## GoCardless Fork
 
-> This is a GoCardless-internal fork of [`grafana/mcp-grafana`](https://github.com/grafana/mcp-grafana). This section documents everything added on top of upstream; everywhere else in this README describes unmodified upstream behavior. The only change is additive and opt-in (two new flags, both unset by default) — there are no changes to any existing flag, tool, or endpoint.
+> This is a GoCardless-internal fork of [`grafana/mcp-grafana`](https://github.com/grafana/mcp-grafana). This section documents everything added on top of upstream; everywhere else in this README describes unmodified upstream behavior. Every change below is additive and opt-in (new flags/env vars, all unset by default) — there are no changes to any existing flag, tool, or endpoint.
+
+### OAuth Broker Integration
 
 **What's added:** two CLI flags, `--oauth-authorization-server` and `--oauth-resource` (see [CLI Flags Reference](#cli-flags-reference)), and — only when the first is set — a new `GET /.well-known/oauth-protected-resource` endpoint on the SSE/streamable-http transports.
 
@@ -51,6 +53,32 @@ This provides access to your Grafana instance and the surrounding ecosystem.
 
 ```bash
 curl https://mcp-grafana.example.com/.well-known/oauth-protected-resource
+```
+
+### Host Header Override for Domain-Enforced Grafana Instances
+
+**What's added:** one environment variable, `GRAFANA_HOST_HEADER`, read by every transport (stdio, sse, streamable-http).
+
+**Why:** `GRAFANA_URL`'s hostname normally serves two purposes at once — it's both the network address `mcp-grafana` dials, and the `Host` header it sends. Those two things are usually the same value, but not always: some Grafana instances (including ones deployed with `enforce_domain: true`, which redirects any request whose `Host` header doesn't match the configured domain) are reachable at a different network address than the hostname they expect to be addressed as — for example an instance sitting behind an external load balancer that also does IAP-style auth, but reachable directly (bypassing that load balancer, and therefore that auth gate) via an internal address when `mcp-grafana` runs on the same cluster/VPC. Without a way to separate "where to dial" from "what Host header to send", using that internal address trips the domain check and every request gets redirected instead of served.
+
+`GRAFANA_HOST_HEADER`, when set, overrides only the outgoing `Host` header — `GRAFANA_URL` still determines what address the request is actually dialed against. It does not affect TLS SNI (Go derives that from the request URL, not the Host header), so it only really matters for a plaintext `http://` route to an internal address; there's no split-horizon DNS or Kubernetes `hostAliases` trick required.
+
+**Example:** `mcp-grafana` reaching an in-cluster Grafana Service directly (bypassing an external load balancer/IAP) while still satisfying that Grafana's `enforce_domain` check:
+
+```json
+{
+  "mcpServers": {
+    "grafana": {
+      "command": "mcp-grafana",
+      "args": [],
+      "env": {
+        "GRAFANA_URL": "http://grafana-server.grafana.svc.cluster.local:3000",
+        "GRAFANA_HOST_HEADER": "grafana.example.com",
+        "GRAFANA_SERVICE_ACCOUNT_TOKEN": "<your service account token>"
+      }
+    }
+  }
+}
 ```
 
 ## Quick Start
@@ -470,7 +498,7 @@ Optionally require MCP clients to authenticate *to the server*. This is separate
 
 Caller authentication is enforced only when `--server-auth-token` is set. When it isn't and the server binds a non-loopback address, the server **starts but logs a security error** — emitted at the `error` log level so it isn't hidden by `--log-level` (loopback and stdio are unaffected); a future major release will make that a startup error. Use TLS (or TLS termination) whenever caller auth is enabled on a non-loopback address. When caller auth is enabled, the validated `Authorization` header is stripped before requests reach Grafana; combining `--server-auth-token` with `GRAFANA_FORWARD_HEADERS=Authorization` is rejected at startup.
 
-> **GoCardless fork:** `--oauth-authorization-server` and `--oauth-resource` are additions not present upstream. See [GoCardless Fork: OAuth Broker Integration](#gocardless-fork-oauth-broker-integration) for what they do and why.
+> **GoCardless fork:** `--oauth-authorization-server` and `--oauth-resource` are additions not present upstream. See [GoCardless Fork → OAuth Broker Integration](#oauth-broker-integration) for what they do and why.
 
 **Debug and Logging:**
 - `--debug`: Enable debug mode for detailed HTTP request/response logging
@@ -743,6 +771,8 @@ You can add arbitrary HTTP headers to all Grafana API requests using the `GRAFAN
   }
 }
 ```
+
+> **GoCardless fork:** this cannot be used to override the `Host` header — Go's HTTP client always takes the wire `Host` from the request URL (or `Request.Host`), never from a header map entry. For that, see [GoCardless Fork → Host Header Override](#host-header-override-for-domain-enforced-grafana-instances), which adds `GRAFANA_HOST_HEADER` for exactly this case.
 
 ### SOCKS5 Proxy
 

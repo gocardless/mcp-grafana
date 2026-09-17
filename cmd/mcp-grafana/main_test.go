@@ -1349,6 +1349,29 @@ func TestSOCKS5ProxyFromEnv(t *testing.T) {
 	})
 }
 
+func TestHostHeaderFromEnv(t *testing.T) {
+	t.Run("unset env leaves host header empty", func(t *testing.T) {
+		t.Setenv("GRAFANA_HOST_HEADER", "")
+		raw, err := hostHeaderFromEnv()
+		require.NoError(t, err)
+		assert.Empty(t, raw)
+	})
+
+	t.Run("valid hostname is returned trimmed", func(t *testing.T) {
+		t.Setenv("GRAFANA_HOST_HEADER", "  grafana.example.com  ")
+		raw, err := hostHeaderFromEnv()
+		require.NoError(t, err)
+		assert.Equal(t, "grafana.example.com", raw)
+	})
+
+	t.Run("invalid value is an error naming the env var", func(t *testing.T) {
+		t.Setenv("GRAFANA_HOST_HEADER", "https://grafana.example.com")
+		_, err := hostHeaderFromEnv()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "GRAFANA_HOST_HEADER")
+	})
+}
+
 // safeQueryToolNames execute a query the query language cannot use to mutate
 // data. --disable-query removes them; --disable-write must not.
 var safeQueryToolNames = []string{
