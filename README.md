@@ -41,7 +41,7 @@ This provides access to your Grafana instance and the surrounding ecosystem.
 **Flags:**
 
 - `--oauth-authorization-server`: Base URL of the broker (e.g. `https://mcp-auth-broker.example.com`). When set, the server exposes `GET /.well-known/oauth-protected-resource` (RFC 9728) advertising it. Falls back to the `MCP_GRAFANA_OAUTH_AUTHORIZATION_SERVER` environment variable. Unset by default — the endpoint is not exposed, and behavior is identical to upstream.
-- `--oauth-resource`: Overrides the `resource` identifier in the metadata document. Defaults to the request's scheme and `Host` header plus `--endpoint-path` (streamable-http) or `--base-path` (sse); only needed if the server is reachable through more than one hostname.
+- `--oauth-resource`: Overrides the `resource` identifier in the metadata document. Defaults to the request's scheme and `Host` header plus `--endpoint-path` (streamable-http) or `--base-path` (sse); only needed if the server is reachable through more than one hostname. Falls back to the `MCP_GRAFANA_OAUTH_RESOURCE` environment variable.
 
 **Example:**
 

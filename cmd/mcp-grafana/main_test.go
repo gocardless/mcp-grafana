@@ -1212,6 +1212,26 @@ func TestOAuthResourceConfigResolveAuthorizationServer(t *testing.T) {
 	})
 }
 
+func TestOAuthResourceConfigResolveResource(t *testing.T) {
+	t.Run("flag takes precedence and is trimmed", func(t *testing.T) {
+		t.Setenv(oauthResourceEnvVar, "https://from-env.example.com/mcp")
+		oc := oauthResourceConfig{resource: "  https://from-flag.example.com/mcp  "}
+		assert.Equal(t, "https://from-flag.example.com/mcp", oc.resolveResource())
+	})
+
+	t.Run("falls back to env when flag empty", func(t *testing.T) {
+		t.Setenv(oauthResourceEnvVar, "  https://from-env.example.com/mcp  ")
+		oc := oauthResourceConfig{}
+		assert.Equal(t, "https://from-env.example.com/mcp", oc.resolveResource())
+	})
+
+	t.Run("empty when neither set, so the handler derives it per-request", func(t *testing.T) {
+		t.Setenv(oauthResourceEnvVar, "")
+		oc := oauthResourceConfig{}
+		assert.Empty(t, oc.resolveResource())
+	})
+}
+
 func TestRequestBaseURL(t *testing.T) {
 	t.Run("uses https for a direct TLS connection", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "https://mcp-grafana.example.com/", nil)

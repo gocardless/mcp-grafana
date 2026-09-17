@@ -748,6 +748,9 @@ func (ca callerAuthConfig) resolveToken() string {
 // --oauth-authorization-server, mirroring serverAuthTokenEnvVar.
 const oauthAuthorizationServerEnvVar = "MCP_GRAFANA_OAUTH_AUTHORIZATION_SERVER"
 
+// oauthResourceEnvVar is the env fallback for --oauth-resource.
+const oauthResourceEnvVar = "MCP_GRAFANA_OAUTH_RESOURCE"
+
 // oauthProtectedResourcePath is the RFC 9728 well-known path MCP clients
 // probe to discover which OAuth authorization server protects this resource.
 const oauthProtectedResourcePath = "/.well-known/oauth-protected-resource"
@@ -774,7 +777,7 @@ type oauthResourceConfig struct {
 
 func (oc *oauthResourceConfig) addFlags() {
 	flag.StringVar(&oc.authorizationServer, "oauth-authorization-server", "", "Base URL of an external OAuth 2.1 authorization server/broker that MCP clients should use to obtain a token for this server. When set, the server exposes GET "+oauthProtectedResourcePath+" (RFC 9728) advertising it, so OAuth-capable MCP clients can discover it automatically. Falls back to the "+oauthAuthorizationServerEnvVar+" environment variable. Has no effect on the stdio transport.")
-	flag.StringVar(&oc.resource, "oauth-resource", "", "Canonical resource identifier advertised in the protected-resource metadata document. Defaults to the request's scheme and Host plus --endpoint-path (streamable-http) or --base-path (sse); set explicitly only if this server is reachable through more than one hostname.")
+	flag.StringVar(&oc.resource, "oauth-resource", "", "Canonical resource identifier advertised in the protected-resource metadata document. Defaults to the request's scheme and Host plus --endpoint-path (streamable-http) or --base-path (sse); set explicitly only if this server is reachable through more than one hostname. Falls back to the "+oauthResourceEnvVar+" environment variable.")
 }
 
 // resolveAuthorizationServer returns the configured broker URL, falling back
@@ -785,6 +788,15 @@ func (oc oauthResourceConfig) resolveAuthorizationServer() string {
 		return v
 	}
 	return strings.TrimSpace(os.Getenv(oauthAuthorizationServerEnvVar))
+}
+
+// resolveResource returns the configured resource override, falling back to
+// the env var. Empty means "derive it per-request" — see requestBaseURL.
+func (oc oauthResourceConfig) resolveResource() string {
+	if v := strings.TrimSpace(oc.resource); v != "" {
+		return v
+	}
+	return strings.TrimSpace(os.Getenv(oauthResourceEnvVar))
 }
 
 // requestBaseURL reconstructs scheme://host from an inbound request, honoring
@@ -1161,7 +1173,7 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 			basePath,
 		)))
 		if authServer := oc.resolveAuthorizationServer(); authServer != "" {
-			mux.HandleFunc(oauthProtectedResourcePath, oauthProtectedResourceHandler(authServer, oc.resource, basePath))
+			mux.HandleFunc(oauthProtectedResourcePath, oauthProtectedResourceHandler(authServer, oc.resolveResource(), basePath))
 			slog.Info("OAuth protected-resource metadata enabled", "path", oauthProtectedResourcePath, "authorization_server", authServer)
 		}
 		runOpsServers(registerOps(mux, o, healthzAddress, obs))
@@ -1199,7 +1211,7 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 			endpointPath,
 		)))
 		if authServer := oc.resolveAuthorizationServer(); authServer != "" {
-			mux.HandleFunc(oauthProtectedResourcePath, oauthProtectedResourceHandler(authServer, oc.resource, endpointPath))
+			mux.HandleFunc(oauthProtectedResourcePath, oauthProtectedResourceHandler(authServer, oc.resolveResource(), endpointPath))
 			slog.Info("OAuth protected-resource metadata enabled", "path", oauthProtectedResourcePath, "authorization_server", authServer)
 		}
 		runOpsServers(registerOps(mux, o, healthzAddress, obs))
