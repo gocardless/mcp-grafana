@@ -290,18 +290,8 @@ type GrafanaConfig struct {
 	// opaque RoundTripper.
 	SOCKS5ProxyURL string
 
-	// HostHeader, when non-empty, overrides the Host header sent on every
-	// Grafana request, independent of the hostname in URL/GRAFANA_URL. This
-	// lets GRAFANA_URL point at a network address the request should actually
-	// be dialed against (e.g. an in-cluster Service address) while the wire
-	// Host header stays whatever hostname the Grafana instance itself expects
-	// to be addressed as — for example a Grafana behind an external
-	// load-balancer/IAP that also enforces a specific server domain
-	// (`enforce_domain`) at the application layer, reachable from inside the
-	// same cluster at a different address that bypasses the load balancer
-	// entirely. It does not affect TLS SNI, which Go derives from the
-	// request URL, not the Host header. The CLI populates it from
-	// GRAFANA_HOST_HEADER.
+	// HostHeader, when non-empty, overrides the outgoing Host header
+	// independent of GRAFANA_URL's hostname. Populated from GRAFANA_HOST_HEADER.
 	HostHeader string
 
 	// MaxLokiLogLimit is the maximum number of log lines that can be returned
@@ -681,14 +671,8 @@ func NewExtraHeadersRoundTripper(rt http.RoundTripper, headers map[string]string
 	}
 }
 
-// hostHeaderRoundTripper overrides the outgoing request's Host header,
-// independent of the network address the request is dialed against (that
-// address comes from the request's URL and is untouched here). Go's HTTP
-// client writes the wire "Host:" header — and, for HTTP/2, the ":authority"
-// pseudo-header — from Request.Host when it is set, falling back to
-// Request.URL.Host otherwise; it does not affect which address the
-// connection is actually dialed to, or the TLS ServerName used for the
-// handshake (both of those come from Request.URL).
+// hostHeaderRoundTripper overrides the wire Host header via Request.Host,
+// leaving the dial target and TLS ServerName (both from Request.URL) untouched.
 type hostHeaderRoundTripper struct {
 	underlying http.RoundTripper
 	host       string
@@ -700,9 +684,6 @@ func (t *hostHeaderRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 	return t.underlying.RoundTrip(clonedReq)
 }
 
-// NewHostHeaderRoundTripper wraps rt so every request's Host header is
-// overridden to host. See hostHeaderRoundTripper for what this does and does
-// not affect.
 func NewHostHeaderRoundTripper(rt http.RoundTripper, host string) *hostHeaderRoundTripper {
 	if rt == nil {
 		rt = http.DefaultTransport
@@ -710,12 +691,8 @@ func NewHostHeaderRoundTripper(rt http.RoundTripper, host string) *hostHeaderRou
 	return &hostHeaderRoundTripper{underlying: rt, host: host}
 }
 
-// ValidateHostHeader reports whether raw is a valid GrafanaConfig.HostHeader
-// value. It is intended for early validation at startup, so that a common
-// mistake (pasting a full URL instead of a bare host) fails fast instead of
-// silently breaking every Grafana request behind a domain-enforcing proxy.
-// Otherwise permissive, since the HTTP Host header accepts a wide range of
-// forms (hostname, hostname:port, an IPv6 literal in brackets).
+// ValidateHostHeader rejects the common mistake of pasting a full URL
+// instead of a bare host[:port]; otherwise permissive.
 func ValidateHostHeader(raw string) error {
 	if raw == "" {
 		return fmt.Errorf("must not be empty")
@@ -932,10 +909,7 @@ func BuildTransport(cfg *GrafanaConfig, base http.RoundTripper, opts ...Transpor
 		}
 	}
 
-	// Host header override. Placed just outside debug logging (rather than
-	// alongside TLS/SOCKS5 below the base transport) so a debug log still
-	// shows the actual overridden Host that goes out on the wire — see
-	// GrafanaConfig.HostHeader.
+	// Placed above debug logging so a debug log reflects the overridden Host.
 	if cfg.HostHeader != "" {
 		transport = NewHostHeaderRoundTripper(transport, cfg.HostHeader)
 	}

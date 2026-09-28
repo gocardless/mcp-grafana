@@ -370,11 +370,8 @@ func socks5ProxyFromEnv() (string, error) {
 	return raw, nil
 }
 
-// hostHeaderFromEnv reads GRAFANA_HOST_HEADER and validates it so a
-// misconfigured value fails at startup instead of silently 302-redirect-looping
-// on every Grafana request behind a domain-enforcing proxy (e.g. Grafana's own
-// enforce_domain setting) once GRAFANA_URL points somewhere other than that
-// domain. Extracted from main so the handling is unit-testable.
+// hostHeaderFromEnv reads and validates GRAFANA_HOST_HEADER, failing fast
+// rather than silently breaking every Grafana request later.
 func hostHeaderFromEnv() (string, error) {
 	raw := strings.TrimSpace(os.Getenv("GRAFANA_HOST_HEADER"))
 	if raw == "" {
@@ -744,34 +741,21 @@ func (ca callerAuthConfig) resolveToken() string {
 	return strings.TrimSpace(os.Getenv(serverAuthTokenEnvVar))
 }
 
-// oauthAuthorizationServerEnvVar is the env fallback for
-// --oauth-authorization-server, mirroring serverAuthTokenEnvVar.
 const oauthAuthorizationServerEnvVar = "MCP_GRAFANA_OAUTH_AUTHORIZATION_SERVER"
 
-// oauthResourceEnvVar is the env fallback for --oauth-resource.
 const oauthResourceEnvVar = "MCP_GRAFANA_OAUTH_RESOURCE"
 
-// oauthProtectedResourcePath is the RFC 9728 well-known path MCP clients
-// probe to discover which OAuth authorization server protects this resource.
+// oauthProtectedResourcePath is the RFC 9728 well-known discovery path.
 const oauthProtectedResourcePath = "/.well-known/oauth-protected-resource"
 
-// oauthResourceConfig configures discovery of an external OAuth 2.1
-// authorization server (a "broker") that fronts this server behind something
-// like GCP Identity-Aware Proxy. It is unrelated to callerAuthConfig: the
-// broker mediates a real OAuth flow so an MCP client can obtain a token the
-// proxy accepts, whereas --server-auth-token is a static shared secret this
-// process checks itself. The broker's URL is entirely operator-supplied
-// (flag or env var); nothing here is specific to any particular deployment.
+// oauthResourceConfig configures RFC 9728 discovery of an external OAuth
+// broker (e.g. behind GCP IAP). Unrelated to callerAuthConfig's static secret.
 type oauthResourceConfig struct {
-	// authorizationServer is the base URL of the broker, e.g.
-	// "https://mcp-auth-broker.example.com". Empty disables the endpoint.
+	// authorizationServer is the broker's base URL. Empty disables the endpoint.
 	authorizationServer string
 
-	// resource overrides the "resource" identifier advertised in the
-	// metadata document. When empty it is derived per-request from the
-	// request's scheme and Host header plus the MCP endpoint/base path,
-	// which is correct as long as the server is reachable through a single
-	// canonical hostname (the norm behind IAP).
+	// resource overrides the advertised "resource" identifier. Empty derives
+	// it per-request from the request's scheme, Host header, and endpoint path.
 	resource string
 }
 
@@ -780,9 +764,7 @@ func (oc *oauthResourceConfig) addFlags() {
 	flag.StringVar(&oc.resource, "oauth-resource", "", "Canonical resource identifier advertised in the protected-resource metadata document. Defaults to the request's scheme and Host plus --endpoint-path (streamable-http) or --base-path (sse); set explicitly only if this server is reachable through more than one hostname. Falls back to the "+oauthResourceEnvVar+" environment variable.")
 }
 
-// resolveAuthorizationServer returns the configured broker URL, falling back
-// to the env var. Trimmed so whitespace from a config mount can't produce a
-// non-empty-looking but broken value.
+// resolveAuthorizationServer returns the flag value, falling back to the env var.
 func (oc oauthResourceConfig) resolveAuthorizationServer() string {
 	if v := strings.TrimSpace(oc.authorizationServer); v != "" {
 		return v
@@ -790,8 +772,7 @@ func (oc oauthResourceConfig) resolveAuthorizationServer() string {
 	return strings.TrimSpace(os.Getenv(oauthAuthorizationServerEnvVar))
 }
 
-// resolveResource returns the configured resource override, falling back to
-// the env var. Empty means "derive it per-request" — see requestBaseURL.
+// resolveResource returns the flag or env var value; empty means derive it per-request.
 func (oc oauthResourceConfig) resolveResource() string {
 	if v := strings.TrimSpace(oc.resource); v != "" {
 		return v
@@ -799,11 +780,8 @@ func (oc oauthResourceConfig) resolveResource() string {
 	return strings.TrimSpace(os.Getenv(oauthResourceEnvVar))
 }
 
-// requestBaseURL reconstructs scheme://host from an inbound request, honoring
-// X-Forwarded-Proto from a trusted reverse proxy (IAP/GCLB terminate TLS at
-// the edge, so the server itself typically sees plain HTTP on the wire but
-// gets told the original scheme via this header). Falls back to https unless
-// the connection is both unproxied and non-TLS, e.g. local development.
+// requestBaseURL reconstructs scheme://host from a request, honoring
+// X-Forwarded-Proto (set by TLS-terminating proxies like IAP/GCLB).
 func requestBaseURL(r *http.Request) string {
 	scheme := "https"
 	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
@@ -814,10 +792,8 @@ func requestBaseURL(r *http.Request) string {
 	return scheme + "://" + r.Host
 }
 
-// oauthProtectedResourceHandler serves RFC 9728 OAuth protected-resource
-// metadata, pointing MCP clients at the configured authorization server
-// (broker). It is always left unauthenticated on the mux: a client has no
-// token to present until after it has fetched this document.
+// oauthProtectedResourceHandler serves RFC 9728 protected-resource metadata.
+// Always unauthenticated: a client has no token before fetching this.
 func oauthProtectedResourceHandler(authorizationServer, resourceOverride, mountPath string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		resource := resourceOverride

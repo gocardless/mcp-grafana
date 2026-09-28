@@ -1288,11 +1288,8 @@ func TestOAuthProtectedResourceHandler(t *testing.T) {
 	})
 }
 
-// TestOAuthProtectedResourceUnauthenticatedAlongsideCallerAuth mirrors how
-// run() composes the mux: the MCP endpoint is wrapped with withCallerAuth,
-// but /.well-known/oauth-protected-resource is registered directly on the
-// mux and must stay reachable without a bearer token — an MCP client has no
-// token to present until after it has fetched this document.
+// TestOAuthProtectedResourceUnauthenticatedAlongsideCallerAuth checks the
+// well-known endpoint stays reachable without a token even with caller auth on.
 func TestOAuthProtectedResourceUnauthenticatedAlongsideCallerAuth(t *testing.T) {
 	const endpointPath = "/mcp"
 	mux := http.NewServeMux()
