@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -369,6 +370,19 @@ func socks5ProxyFromEnv() (string, error) {
 	return raw, nil
 }
 
+// hostHeaderFromEnv reads and validates GRAFANA_HOST_HEADER, failing fast
+// rather than silently breaking every Grafana request later.
+func hostHeaderFromEnv() (string, error) {
+	raw := strings.TrimSpace(os.Getenv("GRAFANA_HOST_HEADER"))
+	if raw == "" {
+		return "", nil
+	}
+	if err := mcpgrafana.ValidateHostHeader(raw); err != nil {
+		return "", fmt.Errorf("invalid GRAFANA_HOST_HEADER: %w", err)
+	}
+	return raw, nil
+}
+
 // validateLokiGuardrail rejects invalid guardrail settings (unknown mode,
 // negative limits) after flag and env processing. Extracted from main so the
 // validation is unit-testable.
@@ -703,6 +717,73 @@ func (ca callerAuthConfig) resolveToken() string {
 	return strings.TrimSpace(os.Getenv(serverAuthTokenEnvVar))
 }
 
+const oauthAuthorizationServerEnvVar = "MCP_GRAFANA_OAUTH_AUTHORIZATION_SERVER"
+
+const oauthResourceEnvVar = "MCP_GRAFANA_OAUTH_RESOURCE"
+
+// oauthProtectedResourcePath is the RFC 9728 well-known discovery path.
+const oauthProtectedResourcePath = "/.well-known/oauth-protected-resource"
+
+// oauthResourceConfig configures RFC 9728 discovery of an external OAuth
+// broker (e.g. behind GCP IAP). Unrelated to callerAuthConfig's static secret.
+type oauthResourceConfig struct {
+	// authorizationServer is the broker's base URL. Empty disables the endpoint.
+	authorizationServer string
+
+	// resource overrides the advertised "resource" identifier. Empty derives
+	// it per-request from the request's scheme, Host header, and endpoint path.
+	resource string
+}
+
+func (oc *oauthResourceConfig) addFlags() {
+	flag.StringVar(&oc.authorizationServer, "oauth-authorization-server", "", "Base URL of an external OAuth 2.1 authorization server/broker that MCP clients should use to obtain a token for this server. When set, the server exposes GET "+oauthProtectedResourcePath+" (RFC 9728) advertising it, so OAuth-capable MCP clients can discover it automatically. Falls back to the "+oauthAuthorizationServerEnvVar+" environment variable. Has no effect on the stdio transport.")
+	flag.StringVar(&oc.resource, "oauth-resource", "", "Canonical resource identifier advertised in the protected-resource metadata document. Defaults to the request's scheme and Host plus --endpoint-path (streamable-http) or --base-path (sse); set explicitly only if this server is reachable through more than one hostname. Falls back to the "+oauthResourceEnvVar+" environment variable.")
+}
+
+// resolveAuthorizationServer returns the flag value, falling back to the env var.
+func (oc oauthResourceConfig) resolveAuthorizationServer() string {
+	if v := strings.TrimSpace(oc.authorizationServer); v != "" {
+		return v
+	}
+	return strings.TrimSpace(os.Getenv(oauthAuthorizationServerEnvVar))
+}
+
+// resolveResource returns the flag or env var value; empty means derive it per-request.
+func (oc oauthResourceConfig) resolveResource() string {
+	if v := strings.TrimSpace(oc.resource); v != "" {
+		return v
+	}
+	return strings.TrimSpace(os.Getenv(oauthResourceEnvVar))
+}
+
+// requestBaseURL reconstructs scheme://host from a request, honoring
+// X-Forwarded-Proto (set by TLS-terminating proxies like IAP/GCLB).
+func requestBaseURL(r *http.Request) string {
+	scheme := "https"
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
+	} else if r.TLS == nil {
+		scheme = "http"
+	}
+	return scheme + "://" + r.Host
+}
+
+// oauthProtectedResourceHandler serves RFC 9728 protected-resource metadata.
+// Always unauthenticated: a client has no token before fetching this.
+func oauthProtectedResourceHandler(authorizationServer, resourceOverride, mountPath string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		resource := resourceOverride
+		if resource == "" {
+			resource = requestBaseURL(r) + mountPath
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"resource":              resource,
+			"authorization_servers": []string{authorizationServer},
+		})
+	}
+}
+
 // checkCallerAuthPolicy logs the caller-authentication posture of a network
 // transport at startup. Caller auth is enforced only when a token is configured
 // (see withCallerAuth); this surfaces the posture so it isn't silently exposed:
@@ -914,7 +995,7 @@ func runOpsServer(addr string, h http.Handler) {
 	}
 }
 
-func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt disabledTools, gc mcpgrafana.GrafanaConfig, tls tlsConfig, hsc httpSecurityConfig, ca callerAuthConfig, obs observability.Config, sessionIdleTimeoutMinutes int, healthzAddress, instructionsAppend string) error {
+func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt disabledTools, gc mcpgrafana.GrafanaConfig, tls tlsConfig, hsc httpSecurityConfig, ca callerAuthConfig, oc oauthResourceConfig, obs observability.Config, sessionIdleTimeoutMinutes int, healthzAddress, instructionsAppend string) error {
 	stderrHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})
 	slog.SetDefault(slog.New(stderrHandler))
 
@@ -1043,6 +1124,10 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 			mcpgrafana.ValidateGrafanaURLMiddleware(srv), //nolint:staticcheck // Retained temporarily to reject malformed legacy headers.
 			basePath,
 		)))
+		if authServer := oc.resolveAuthorizationServer(); authServer != "" {
+			mux.HandleFunc(oauthProtectedResourcePath, oauthProtectedResourceHandler(authServer, oc.resolveResource(), basePath))
+			slog.Info("OAuth protected-resource metadata enabled", "path", oauthProtectedResourcePath, "authorization_server", authServer)
+		}
 		runOpsServers(registerOps(mux, o, healthzAddress, obs))
 		// Wrap the full mux so ops routes left on it are validated too.
 		httpSrv.Handler = mcpgrafana.DNSRebindingProtectionMiddleware(hsc.policy(addr))(mux)
@@ -1077,6 +1162,10 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 			mcpgrafana.ValidateGrafanaURLMiddleware(srv), //nolint:staticcheck // Retained temporarily to reject malformed legacy headers.
 			endpointPath,
 		)))
+		if authServer := oc.resolveAuthorizationServer(); authServer != "" {
+			mux.HandleFunc(oauthProtectedResourcePath, oauthProtectedResourceHandler(authServer, oc.resolveResource(), endpointPath))
+			slog.Info("OAuth protected-resource metadata enabled", "path", oauthProtectedResourcePath, "authorization_server", authServer)
+		}
 		runOpsServers(registerOps(mux, o, healthzAddress, obs))
 		// Wrap the full mux so ops routes left on it are validated too.
 		httpSrv.Handler = mcpgrafana.DNSRebindingProtectionMiddleware(hsc.policy(addr))(mux)
@@ -1116,6 +1205,8 @@ func main() {
 	hsc.addFlags()
 	var ca callerAuthConfig
 	ca.addFlags()
+	var oc oauthResourceConfig
+	oc.addFlags()
 	var obs observability.Config
 	flag.BoolVar(&obs.MetricsEnabled, "metrics", false, "Enable Prometheus metrics endpoint")
 	flag.StringVar(&obs.MetricsAddress, "metrics-address", "", "Separate address for metrics server (e.g., :9090). If empty, metrics are served on the main server at /metrics")
@@ -1177,6 +1268,12 @@ func main() {
 		os.Exit(2)
 	}
 
+	hostHeader, err := hostHeaderFromEnv()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+
 	// Enable per-call org selection before any tools are registered, so their
 	// schemas and the override middleware are wired in consistently.
 	mcpgrafana.DynamicMultiOrgEnabled = gc.dynamicMultiOrg
@@ -1191,6 +1288,7 @@ func main() {
 		IncludeArgumentsInSpans: gc.includeArgsInSpans,
 		Timeout:                 gc.timeout,
 		SOCKS5ProxyURL:          socks5Proxy,
+		HostHeader:              hostHeader,
 	}
 	if gc.tlsCertFile != "" || gc.tlsKeyFile != "" || gc.tlsCAFile != "" || gc.tlsSkipVerify {
 		grafanaConfig.TLSConfig = &mcpgrafana.TLSConfig{
@@ -1237,7 +1335,7 @@ func main() {
 		level = slog.LevelDebug
 	}
 
-	if err := run(transport, *addr, *basePath, *endpointPath, level, dt, grafanaConfig, tls, hsc, ca, obs, *sessionIdleTimeoutMinutes, *healthzAddress, *instructionsAppend); err != nil {
+	if err := run(transport, *addr, *basePath, *endpointPath, level, dt, grafanaConfig, tls, hsc, ca, oc, obs, *sessionIdleTimeoutMinutes, *healthzAddress, *instructionsAppend); err != nil {
 		panic(err)
 	}
 }

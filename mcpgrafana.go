@@ -290,6 +290,10 @@ type GrafanaConfig struct {
 	// opaque RoundTripper.
 	SOCKS5ProxyURL string
 
+	// HostHeader, when non-empty, overrides the outgoing Host header
+	// independent of GRAFANA_URL's hostname. Populated from GRAFANA_HOST_HEADER.
+	HostHeader string
+
 	// MaxLokiLogLimit is the maximum number of log lines that can be returned
 	// from Loki queries.
 	MaxLokiLogLimit int
@@ -673,6 +677,44 @@ func NewExtraHeadersRoundTripper(rt http.RoundTripper, headers map[string]string
 	}
 }
 
+// hostHeaderRoundTripper overrides the wire Host header via Request.Host,
+// leaving the dial target and TLS ServerName (both from Request.URL) untouched.
+type hostHeaderRoundTripper struct {
+	underlying http.RoundTripper
+	host       string
+}
+
+func (t *hostHeaderRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	clonedReq := req.Clone(req.Context())
+	clonedReq.Host = t.host
+	return t.underlying.RoundTrip(clonedReq)
+}
+
+func NewHostHeaderRoundTripper(rt http.RoundTripper, host string) *hostHeaderRoundTripper {
+	if rt == nil {
+		rt = http.DefaultTransport
+	}
+	return &hostHeaderRoundTripper{underlying: rt, host: host}
+}
+
+// ValidateHostHeader rejects the common mistake of pasting a full URL
+// instead of a bare host[:port]; otherwise permissive.
+func ValidateHostHeader(raw string) error {
+	if raw == "" {
+		return fmt.Errorf("must not be empty")
+	}
+	if strings.ContainsAny(raw, " \t\r\n") {
+		return fmt.Errorf("must not contain whitespace")
+	}
+	if strings.Contains(raw, "://") {
+		return fmt.Errorf("must be a bare host (host[:port]), not a URL with a scheme")
+	}
+	if strings.ContainsRune(raw, '/') {
+		return fmt.Errorf("must be a bare host (host[:port]), without a path")
+	}
+	return nil
+}
+
 // AuthRoundTripper wraps an http.RoundTripper to add authentication headers.
 // It supports on-behalf-of (OBO) auth via access/ID tokens, API key bearer
 // auth, and HTTP basic auth, in that priority order.
@@ -813,7 +855,7 @@ func WithoutUserAgent() TransportOption {
 // BuildTransport constructs an http.RoundTripper with the standard middleware
 // chain derived from cfg. The default chain (innermost to outermost) is:
 //
-//	base → TLS → debugLogging → Auth → ExtraHeaders → OrgID → UserAgent → otelhttp
+//	base → TLS → debugLogging → HostHeader → Auth → ExtraHeaders → OrgID → UserAgent → otelhttp
 //
 // Auth is innermost among the header-setting layers so that credentials take
 // precedence over any forwarded/extra headers with the same keys.
@@ -871,6 +913,11 @@ func BuildTransport(cfg *GrafanaConfig, base http.RoundTripper, opts ...Transpor
 			underlying: transport,
 			logger:     cfg.LoggerOrDefault(),
 		}
+	}
+
+	// Placed above debug logging so a debug log reflects the overridden Host.
+	if cfg.HostHeader != "" {
+		transport = NewHostHeaderRoundTripper(transport, cfg.HostHeader)
 	}
 
 	// Auth (innermost header layer — wins on conflicts with ExtraHeaders)
@@ -1476,6 +1523,7 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 						TLSConfig:      config.TLSConfig,
 						ExtraHeaders:   config.ExtraHeaders,
 						SOCKS5ProxyURL: config.SOCKS5ProxyURL,
+						HostHeader:     config.HostHeader,
 						Debug:          config.Debug,
 						Logger:         config.Logger,
 						UserAgent:      config.UserAgent,
@@ -1524,6 +1572,7 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 		TLSConfig:      config.TLSConfig,
 		ExtraHeaders:   config.ExtraHeaders,
 		SOCKS5ProxyURL: config.SOCKS5ProxyURL,
+		HostHeader:     config.HostHeader,
 		Logger:         config.Logger,
 		UserAgent:      config.UserAgent,
 	}

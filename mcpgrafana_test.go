@@ -893,6 +893,74 @@ func TestExtraHeadersRoundTripper(t *testing.T) {
 	})
 }
 
+func TestHostHeaderRoundTripper(t *testing.T) {
+	t.Run("overrides the Host header without touching the dial target", func(t *testing.T) {
+		var capturedReq *http.Request
+		mockRT := &capturingMockRT{
+			fn: func(req *http.Request) (*http.Response, error) {
+				capturedReq = req
+				return &http.Response{StatusCode: 200}, nil
+			},
+		}
+
+		rt := NewHostHeaderRoundTripper(mockRT, "grafana.example.com")
+
+		req, _ := http.NewRequest("GET", "http://grafana-internal.svc.cluster.local:3000/api/health", nil)
+		_, err := rt.RoundTrip(req)
+		require.NoError(t, err)
+
+		assert.Equal(t, "grafana.example.com", capturedReq.Host)
+		assert.Equal(t, "grafana-internal.svc.cluster.local:3000", capturedReq.URL.Host,
+			"the network address to dial must be unaffected by the Host header override")
+	})
+
+	t.Run("does not modify original request", func(t *testing.T) {
+		mockRT := &capturingMockRT{
+			fn: func(req *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 200}, nil
+			},
+		}
+
+		rt := NewHostHeaderRoundTripper(mockRT, "grafana.example.com")
+		req, _ := http.NewRequest("GET", "http://grafana-internal.svc.cluster.local:3000", nil)
+		originalHost := req.Host
+		_, err := rt.RoundTrip(req)
+		require.NoError(t, err)
+
+		assert.Equal(t, originalHost, req.Host, "the original request must not be mutated")
+	})
+
+	t.Run("nil transport uses default", func(t *testing.T) {
+		rt := NewHostHeaderRoundTripper(nil, "grafana.example.com")
+		assert.NotNil(t, rt.underlying)
+	})
+}
+
+func TestValidateHostHeader(t *testing.T) {
+	cases := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{"bare hostname", "grafana.example.com", false},
+		{"hostname with port", "grafana.example.com:3000", false},
+		{"empty", "", true},
+		{"contains scheme", "https://grafana.example.com", true},
+		{"contains path", "grafana.example.com/api", true},
+		{"contains whitespace", "grafana.example.com ", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateHostHeader(tc.value)
+			if tc.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
 type capturingMockRT struct {
 	fn func(*http.Request) (*http.Response, error)
 }
@@ -1031,6 +1099,44 @@ func TestBuildTransport(t *testing.T) {
 		require.NoError(t, err)
 
 		assert.Empty(t, capturedReq.Header.Get("X-Grafana-Org-Id"))
+	})
+
+	t.Run("HostHeader overrides the wire Host without touching the dial target", func(t *testing.T) {
+		var capturedReq *http.Request
+		mock := &capturingMockRT{fn: func(req *http.Request) (*http.Response, error) {
+			capturedReq = req
+			return &http.Response{StatusCode: 200}, nil
+		}}
+
+		cfg := &GrafanaConfig{HostHeader: "grafana.example.com"}
+		transport, err := BuildTransport(cfg, mock, WithoutOtel())
+		require.NoError(t, err)
+
+		req, _ := http.NewRequest("GET", "http://grafana-internal.svc.cluster.local:3000/api/health", nil)
+		_, err = transport.RoundTrip(req)
+		require.NoError(t, err)
+
+		assert.Equal(t, "grafana.example.com", capturedReq.Host)
+		assert.Equal(t, "grafana-internal.svc.cluster.local:3000", capturedReq.URL.Host)
+	})
+
+	t.Run("empty HostHeader leaves the request untouched", func(t *testing.T) {
+		var capturedReq *http.Request
+		mock := &capturingMockRT{fn: func(req *http.Request) (*http.Response, error) {
+			capturedReq = req
+			return &http.Response{StatusCode: 200}, nil
+		}}
+
+		cfg := &GrafanaConfig{}
+		transport, err := BuildTransport(cfg, mock, WithoutOtel())
+		require.NoError(t, err)
+
+		req, _ := http.NewRequest("GET", "http://grafana-internal.svc.cluster.local:3000", nil)
+		_, err = transport.RoundTrip(req)
+		require.NoError(t, err)
+
+		assert.Equal(t, "grafana-internal.svc.cluster.local:3000", capturedReq.Host,
+			"with no override, Host should reflect the request's own URL, not be forced empty or rewritten")
 	})
 
 	t.Run("WithoutUserAgent skips user agent header", func(t *testing.T) {
